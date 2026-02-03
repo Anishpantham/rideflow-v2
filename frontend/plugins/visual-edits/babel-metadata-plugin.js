@@ -15,6 +15,14 @@ const PORTAL_COMP_CACHE = new Map(); // key: absPath::exportName -> boolean
 const DYNAMIC_COMP_CACHE = new Map(); // key: absPath::exportName -> boolean
 const BINDING_DYNAMIC_CACHE = new WeakMap(); // node -> boolean
 
+<<<<<<< HEAD
+=======
+// Cache for cross-file prop source tracking
+// Key: "absoluteFilePath::ComponentName::propName"
+// Value: { sourceInfo, arrayContext, fromFile }
+const PROP_SOURCE_CACHE = new Map();
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
 function resolveImportPath(source, fromFile) {
   const cacheKey = `${fromFile}::${source}`;
   if (RESOLVE_CACHE.has(cacheKey)) return RESOLVE_CACHE.get(cacheKey);
@@ -53,6 +61,32 @@ function resolveImportPath(source, fromFile) {
   return null;
 }
 
+<<<<<<< HEAD
+=======
+/**
+ * Gets the absolute path of an imported component's source file.
+ * Returns null if the component is defined in the same file.
+ */
+function getComponentSourcePath(binding, state) {
+  if (!binding || !binding.path) return null;
+
+  const bindingPath = binding.path;
+  const fileFrom = state.filename || state.file?.opts?.filename || __filename;
+
+  if (bindingPath.isImportSpecifier()) {
+    const from = bindingPath.parent.source.value;
+    return resolveImportPath(from, fileFrom);
+  }
+
+  if (bindingPath.isImportDefaultSpecifier()) {
+    const from = bindingPath.parent.source.value;
+    return resolveImportPath(from, fileFrom);
+  }
+
+  return null; // Same-file binding
+}
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
 function parseFileAst(absPath, parser) {
   try {
     const stat = fs.statSync(absPath);
@@ -334,6 +368,768 @@ const babelMetadataPlugin = ({ types: t }) => {
     "every",
   ]);
 
+<<<<<<< HEAD
+=======
+  // ───────────────────────────────────────────────────────────────────────────
+  // Expression Source Analysis - Track where dynamic content comes from
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Analyzes an expression to determine its source type and traceability
+   * @param {NodePath} exprPath - The expression path to analyze
+   * @param {Object} state - Babel state with filename info
+   * @returns {Object} Source info: { type, varName, file, line, path, isEditable }
+   */
+  function analyzeExpression(exprPath, state) {
+    if (!exprPath || !exprPath.node) return null;
+
+    const node = exprPath.node;
+
+    // Handle Identifier (simple variable reference like {name})
+    if (t.isIdentifier(node)) {
+      return analyzeIdentifier(node.name, exprPath, state);
+    }
+
+    // Handle MemberExpression (like item.name or obj.prop.value)
+    if (t.isMemberExpression(node)) {
+      return analyzeMemberExpression(exprPath, state);
+    }
+
+    // Handle CallExpression (like formatDate(item.date))
+    if (t.isCallExpression(node)) {
+      return { type: "computed", isEditable: false };
+    }
+
+    // Handle TemplateLiteral (like `Hello ${name}`)
+    if (t.isTemplateLiteral(node)) {
+      return { type: "template", isEditable: false };
+    }
+
+    // Handle ConditionalExpression (like condition ? a : b)
+    if (t.isConditionalExpression(node)) {
+      return { type: "computed", isEditable: false };
+    }
+
+    // Handle LogicalExpression (like a && b)
+    if (t.isLogicalExpression(node)) {
+      return { type: "computed", isEditable: false };
+    }
+
+    // Handle BinaryExpression (like a + b)
+    if (t.isBinaryExpression(node)) {
+      return { type: "computed", isEditable: false };
+    }
+
+    return { type: "unknown", isEditable: false };
+  }
+
+  /**
+   * Analyzes an identifier to determine its binding source
+   * @param {string} name - The identifier name
+   * @param {NodePath} exprPath - The expression path
+   * @param {Object} state - Babel state
+   * @param {Object} options - Options
+   * @param {boolean} options.skipArrayContext - Skip array iteration context check to avoid recursion
+   */
+  function analyzeIdentifier(name, exprPath, state, options = {}) {
+    const { skipArrayContext = false } = options;
+
+    const binding = exprPath.scope.getBinding(name);
+    if (!binding) {
+      return { type: "external", varName: name, isEditable: false };
+    }
+
+    const bindingPath = binding.path;
+
+    // Check if this identifier is an array iteration item parameter
+    // (e.g., `review` in `reviews.map((review) => ...)`)
+    // Skip this check when called from getArrayIterationContext to avoid infinite recursion
+    if (!skipArrayContext) {
+      const arrayContext = getArrayIterationContext(exprPath, state);
+      if (arrayContext && arrayContext.itemParam === name) {
+        return {
+          type: "static-imported",
+          varName: arrayContext.arrayVar,
+          file: arrayContext.arrayFile,
+          absFile: arrayContext.absFile,
+          line: arrayContext.arrayLine,
+          isEditable: arrayContext.isEditable,
+          valueType: "array-item",
+          arrayContext: arrayContext,
+        };
+      }
+    }
+
+    // Check for props (function parameters)
+    if (bindingPath.isIdentifier() && bindingPath.parentPath.isFunctionDeclaration()) {
+      // Try to trace the prop back to its source in the same file
+      const componentName = getContainingComponentName(exprPath);
+      const tracedSource = tracePropToSource(name, componentName, exprPath, state);
+
+      if (tracedSource && tracedSource.isEditable) {
+        return {
+          type: "prop",
+          varName: tracedSource.varName, // Use traced source's variable name (e.g., "reviews" not "review")
+          propName: name, // Keep original prop name for reference
+          tracedFrom: tracedSource,
+          file: tracedSource.file,
+          absFile: tracedSource.absFile,
+          line: tracedSource.line,
+          path: tracedSource.path,
+          isEditable: true,
+          arrayContext: tracedSource.arrayContext,
+        };
+      }
+
+      return { type: "prop", varName: name, isEditable: false };
+    }
+
+    // Check if it's a destructured prop from function params
+    if (bindingPath.isObjectPattern() ||
+        (bindingPath.parentPath && bindingPath.parentPath.isObjectPattern())) {
+      const funcParent = bindingPath.findParent(p =>
+        p.isFunctionDeclaration() || p.isArrowFunctionExpression() || p.isFunctionExpression()
+      );
+      if (funcParent && funcParent.node.params.some(param => {
+        if (t.isIdentifier(param)) return false;
+        if (t.isObjectPattern(param)) return true;
+        return false;
+      })) {
+        // Try to trace the prop back to its source in the same file
+        const componentName = getContainingComponentName(exprPath);
+        const tracedSource = tracePropToSource(name, componentName, exprPath, state);
+
+        if (tracedSource && tracedSource.isEditable) {
+          return {
+            type: "prop",
+            varName: tracedSource.varName, // Use traced source's variable name (e.g., "reviews" not "review")
+            propName: name, // Keep original prop name for reference
+            tracedFrom: tracedSource,
+            file: tracedSource.file,
+            absFile: tracedSource.absFile,
+            line: tracedSource.line,
+            path: tracedSource.path,
+            isEditable: true,
+            arrayContext: tracedSource.arrayContext,
+          };
+        }
+
+        return { type: "prop", varName: name, isEditable: false };
+      }
+    }
+
+    // Check for useState
+    if (bindingPath.isVariableDeclarator()) {
+      const init = bindingPath.node.init;
+      if (t.isCallExpression(init) && t.isIdentifier(init.callee)) {
+        const calleeName = init.callee.name;
+        if (calleeName === "useState" || calleeName === "useReducer" ||
+            calleeName === "useContext" || calleeName === "useMemo" ||
+            calleeName === "useCallback") {
+          return { type: "state", varName: name, isEditable: false };
+        }
+      }
+    }
+
+    // Check for imports
+    if (bindingPath.isImportSpecifier() || bindingPath.isImportDefaultSpecifier()) {
+      const importDecl = bindingPath.parentPath.node;
+      const source = importDecl.source.value;
+
+      // Only track @/ and ./ imports as potentially editable
+      if (source.startsWith("@/") || source.startsWith("./") || source.startsWith("../")) {
+        const fileFrom = state.filename || state.file?.opts?.filename || __filename;
+        const absPath = resolveImportPath(source, fileFrom);
+
+        if (absPath) {
+          // Get the original export name
+          let exportName = name;
+          if (bindingPath.isImportSpecifier() && t.isIdentifier(bindingPath.node.imported)) {
+            exportName = bindingPath.node.imported.name;
+          }
+
+          // Try to find the variable declaration in the imported file
+          const varInfo = findExportedVariableInfo(absPath, exportName);
+
+          return {
+            type: "static-imported",
+            varName: exportName,
+            file: source,
+            absFile: absPath,
+            line: varInfo?.line || null,
+            isEditable: varInfo?.isEditable || false,
+            valueType: varInfo?.valueType || null,
+          };
+        }
+      }
+
+      return { type: "external", varName: name, isEditable: false };
+    }
+
+    // Check for local const declarations
+    if (bindingPath.isVariableDeclarator()) {
+      const parent = bindingPath.parentPath;
+      if (parent.isVariableDeclaration() && parent.node.kind === "const") {
+        const init = bindingPath.node.init;
+
+        // Get the current file path for local variables
+        const currentFile = state.filename || state.file?.opts?.filename || null;
+
+        // Check if it's a simple editable value
+        if (t.isStringLiteral(init) || t.isNumericLiteral(init)) {
+          return {
+            type: "static-local",
+            varName: name,
+            absFile: currentFile,
+            line: bindingPath.node.loc?.start.line || null,
+            isEditable: true,
+            valueType: "literal",
+          };
+        }
+
+        if (t.isArrayExpression(init)) {
+          return {
+            type: "static-local",
+            varName: name,
+            absFile: currentFile,
+            line: bindingPath.node.loc?.start.line || null,
+            isEditable: true,
+            valueType: "array",
+          };
+        }
+
+        if (t.isObjectExpression(init)) {
+          return {
+            type: "static-local",
+            varName: name,
+            absFile: currentFile,
+            line: bindingPath.node.loc?.start.line || null,
+            isEditable: true,
+            valueType: "object",
+          };
+        }
+      }
+    }
+
+    return { type: "unknown", varName: name, isEditable: false };
+  }
+
+  /**
+   * Analyzes a member expression like item.name or obj.prop.value
+   */
+  function analyzeMemberExpression(exprPath, state) {
+    const node = exprPath.node;
+
+    // Build the property path (e.g., "name" or "address.city")
+    const propPath = buildPropertyPath(node);
+
+    // Get the root object
+    let root = node;
+    while (t.isMemberExpression(root.object)) {
+      root = root.object;
+    }
+
+    const rootObj = root.object;
+
+    if (t.isIdentifier(rootObj)) {
+      const rootName = rootObj.name;
+
+      // Check if we're inside an array iteration (like .map())
+      const arrayContext = getArrayIterationContext(exprPath, state);
+
+      if (arrayContext && arrayContext.itemParam === rootName) {
+        // This is item.property where item comes from array.map(item => ...)
+        return {
+          type: "static-imported",
+          varName: arrayContext.arrayVar,
+          file: arrayContext.arrayFile,
+          absFile: arrayContext.absFile,
+          line: arrayContext.arrayLine,
+          path: propPath,
+          isEditable: arrayContext.isEditable,
+          valueType: "array-item",
+          arrayContext: arrayContext,
+        };
+      }
+
+      // Analyze the root identifier
+      const rootInfo = analyzeIdentifier(rootName, exprPath, state);
+      if (rootInfo) {
+        return {
+          ...rootInfo,
+          path: propPath,
+        };
+      }
+    }
+
+    return { type: "unknown", path: propPath, isEditable: false };
+  }
+
+  /**
+   * Builds a dot-notation path from a MemberExpression
+   */
+  function buildPropertyPath(node) {
+    const parts = [];
+    let current = node;
+
+    while (t.isMemberExpression(current)) {
+      if (t.isIdentifier(current.property)) {
+        parts.unshift(current.property.name);
+      } else if (t.isNumericLiteral(current.property)) {
+        parts.unshift(`[${current.property.value}]`);
+      } else if (t.isStringLiteral(current.property)) {
+        parts.unshift(current.property.value);
+      }
+      current = current.object;
+    }
+
+    return parts.join(".");
+  }
+
+  /**
+   * Gets the JSX element name from an opening element
+   */
+  function getJSXElementName(openingElement) {
+    const n = openingElement?.name;
+    if (t.isJSXIdentifier(n)) return n.name;
+    if (t.isJSXMemberExpression(n)) return n.property.name;
+    return null;
+  }
+
+  /**
+   * Gets the containing component name for an expression path
+   */
+  function getContainingComponentName(exprPath) {
+    let current = exprPath;
+    while (current) {
+      if (current.isFunctionDeclaration() && current.node.id) {
+        return current.node.id.name;
+      }
+      if (current.isVariableDeclarator() && t.isIdentifier(current.node.id)) {
+        return current.node.id.name;
+      }
+      if (current.isArrowFunctionExpression() || current.isFunctionExpression()) {
+        // Check if parent is variable declarator
+        const parent = current.parentPath;
+        if (parent && parent.isVariableDeclarator() && t.isIdentifier(parent.node.id)) {
+          return parent.node.id.name;
+        }
+      }
+      current = current.parentPath;
+    }
+    return null;
+  }
+
+  /**
+   * Traces a prop back to where it was passed in the same file
+   * @param {string} propName - The prop name to trace
+   * @param {string} componentName - The component that receives the prop
+   * @param {NodePath} exprPath - The expression path for scope access
+   * @param {Object} state - Babel state
+   * @returns {Object|null} Source info if traced, null otherwise
+   */
+  function tracePropToSource(propName, componentName, exprPath, state) {
+    if (!componentName) return null;
+
+    const programPath = exprPath.findParent(p => p.isProgram());
+    if (!programPath) return null;
+
+    let tracedSource = null;
+
+    programPath.traverse({
+      JSXOpeningElement(jsxPath) {
+        if (tracedSource) return;
+
+        const elementName = getJSXElementName(jsxPath.node);
+        if (elementName !== componentName) return;
+
+        // Look for the prop being passed
+        for (const attr of jsxPath.node.attributes || []) {
+          if (!t.isJSXAttribute(attr)) continue;
+          if (!t.isJSXIdentifier(attr.name) || attr.name.name !== propName) continue;
+          if (!t.isJSXExpressionContainer(attr.value)) continue;
+
+          // Found matching prop - analyze the expression passed to it
+          const attrs = jsxPath.get('attributes');
+          const attrPath = attrs.find(
+            a => a.isJSXAttribute() &&
+                 t.isJSXIdentifier(a.node.name) &&
+                 a.node.name.name === propName
+          );
+
+          if (attrPath) {
+            const valuePath = attrPath.get('value');
+            if (valuePath && valuePath.isJSXExpressionContainer()) {
+              const innerExpr = valuePath.get('expression');
+              if (innerExpr && innerExpr.node) {
+                tracedSource = analyzeExpression(innerExpr, state);
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // If found in same file, return it
+    if (tracedSource) return tracedSource;
+
+    // Cross-file lookup
+    return lookupCrossFilePropSource(propName, componentName, state);
+  }
+
+  /**
+   * Records prop source information for cross-file prop tracing.
+   */
+  function recordPropSources(componentName, jsxPath, state) {
+    const binding = jsxPath.scope.getBinding(componentName);
+    if (!binding) return;
+
+    const componentAbsPath = getComponentSourcePath(binding, state);
+    if (!componentAbsPath) return; // Same-file, existing logic handles
+
+    const openingElement = jsxPath.node.openingElement;
+    for (const attr of openingElement.attributes || []) {
+      if (!t.isJSXAttribute(attr)) continue;
+      if (!t.isJSXIdentifier(attr.name)) continue;
+      if (!t.isJSXExpressionContainer(attr.value)) continue;
+
+      const propName = attr.name.name;
+
+      // Find the attribute path
+      const attrPath = jsxPath.get('openingElement.attributes').find(
+        a => a.isJSXAttribute() && a.node.name?.name === propName
+      );
+      if (!attrPath) continue;
+
+      const valuePath = attrPath.get('value.expression');
+      if (!valuePath?.node) continue;
+
+      // Analyze the expression being passed
+      const sourceInfo = analyzeExpression(valuePath, state);
+      const arrayContext = getArrayIterationContext(valuePath, state);
+
+      // Cache it
+      const cacheKey = `${componentAbsPath}::${componentName}::${propName}`;
+      PROP_SOURCE_CACHE.set(cacheKey, {
+        sourceInfo,
+        arrayContext: arrayContext || sourceInfo?.arrayContext,
+        fromFile: state.filename
+      });
+    }
+  }
+
+  /**
+   * Looks up prop source from cross-file cache.
+   */
+  function lookupCrossFilePropSource(propName, componentName, state) {
+    const currentFile = state.filename || state.file?.opts?.filename;
+    if (!currentFile) return null;
+
+    const cacheKey = `${currentFile}::${componentName}::${propName}`;
+    const cached = PROP_SOURCE_CACHE.get(cacheKey);
+
+    if (cached && cached.sourceInfo) {
+      return cached.sourceInfo;
+    }
+
+    // Cache miss - try lazy evaluation
+    return lazyEvaluatePropSource(propName, componentName, currentFile);
+  }
+
+  /**
+   * Lazily finds prop sources by scanning cached ASTs for component usages.
+   */
+  function lazyEvaluatePropSource(propName, componentName, componentFile) {
+    const traverse = require("@babel/traverse").default;
+
+    for (const [absPath, cached] of FILE_AST_CACHE) {
+      if (absPath === componentFile) continue;
+
+      const ast = cached.ast;
+      if (!ast) continue;
+
+      let result = null;
+
+      traverse(ast, {
+        ImportDeclaration(importPath) {
+          if (result) return;
+
+          const source = importPath.node.source.value;
+          const resolvedPath = resolveImportPath(source, absPath);
+          if (resolvedPath !== componentFile) return;
+
+          // Find the local name for this import
+          let localName = null;
+          for (const spec of importPath.node.specifiers) {
+            if (t.isImportSpecifier(spec) && spec.imported.name === componentName) {
+              localName = spec.local.name;
+            } else if (t.isImportDefaultSpecifier(spec)) {
+              localName = spec.local.name;
+            }
+          }
+          if (!localName) return;
+
+          // Search for usages of this component
+          importPath.parentPath.parentPath.traverse({
+            JSXOpeningElement(jsxPath) {
+              if (result) return;
+
+              const elemName = getJSXElementName(jsxPath.node);
+              if (elemName !== localName) return;
+
+              // Find the prop
+              for (const attr of jsxPath.node.attributes || []) {
+                if (!t.isJSXAttribute(attr)) continue;
+                if (!t.isJSXIdentifier(attr.name) || attr.name.name !== propName) continue;
+                if (!t.isJSXExpressionContainer(attr.value)) continue;
+
+                const attrPath = jsxPath.get('attributes').find(
+                  a => a.isJSXAttribute() && a.node.name?.name === propName
+                );
+
+                if (attrPath) {
+                  const valuePath = attrPath.get('value.expression');
+                  if (valuePath?.node) {
+                    const mockState = { filename: absPath };
+                    result = analyzeExpression(valuePath, mockState);
+
+                    // Cache for future
+                    const cacheKey = `${componentFile}::${componentName}::${propName}`;
+                    PROP_SOURCE_CACHE.set(cacheKey, {
+                      sourceInfo: result,
+                      arrayContext: result?.arrayContext,
+                      fromFile: absPath
+                    });
+                  }
+                }
+              }
+            }
+          });
+        }
+      });
+
+      if (result) return result;
+    }
+
+    return null;
+  }
+
+  /**
+   * Detects if we're inside an array iteration (.map(), etc.) and extracts context
+   */
+  function getArrayIterationContext(exprPath, state) {
+    // Find the parent .map() or similar call
+    const callExprParent = exprPath.findParent((p) => {
+      if (!p.isCallExpression()) return false;
+
+      const { callee } = p.node;
+      if (!t.isMemberExpression(callee) || !t.isIdentifier(callee.property)) {
+        return false;
+      }
+
+      return ARRAY_METHODS.has(callee.property.name);
+    });
+
+    if (!callExprParent) return null;
+
+    const callExpr = callExprParent.node;
+    const callee = callExpr.callee;
+
+    // Get the array being iterated
+    const arrayNode = callee.object;
+
+    // Get the callback function
+    const callback = callExpr.arguments[0];
+    if (!callback) return null;
+
+    // Get item parameter name(s)
+    let itemParam = null;
+    let indexParam = null;
+
+    if (t.isArrowFunctionExpression(callback) || t.isFunctionExpression(callback)) {
+      const params = callback.params;
+      if (params.length > 0 && t.isIdentifier(params[0])) {
+        itemParam = params[0].name;
+      }
+      if (params.length > 1 && t.isIdentifier(params[1])) {
+        indexParam = params[1].name;
+      }
+    }
+
+    if (!itemParam) return null;
+
+    // Analyze the array source
+    let arrayVar = null;
+    let arrayFile = null;
+    let absFile = null;
+    let arrayLine = null;
+    let isEditable = false;
+
+    if (t.isIdentifier(arrayNode)) {
+      arrayVar = arrayNode.name;
+      // Pass skipArrayContext to avoid infinite recursion
+      const arrayInfo = analyzeIdentifier(arrayVar, callExprParent.get("callee.object"), state, { skipArrayContext: true });
+
+      if (arrayInfo) {
+        arrayFile = arrayInfo.file || null;
+        absFile = arrayInfo.absFile || null;
+        arrayLine = arrayInfo.line || null;
+        isEditable = arrayInfo.isEditable && arrayInfo.valueType === "array";
+      }
+    } else if (t.isMemberExpression(arrayNode)) {
+      // Handle cases like data.items.map(...)
+      const memberInfo = analyzeMemberExpression(
+        callExprParent.get("callee.object"),
+        state
+      );
+      if (memberInfo) {
+        arrayVar = memberInfo.varName;
+        arrayFile = memberInfo.file || null;
+        absFile = memberInfo.absFile || null;
+        arrayLine = memberInfo.line || null;
+        // Array within object is more complex, mark as not editable for now
+        isEditable = false;
+      }
+    }
+
+    return {
+      arrayVar,
+      arrayFile,
+      absFile,
+      arrayLine,
+      itemParam,
+      indexParam,
+      isEditable,
+    };
+  }
+
+  /**
+   * Finds info about an exported variable in a file
+   */
+  function findExportedVariableInfo(absPath, exportName) {
+    const parser = require("@babel/parser");
+    const traverse = require("@babel/traverse").default;
+
+    const ast = parseFileAst(absPath, parser);
+    if (!ast) return null;
+
+    let result = null;
+
+    traverse(ast, {
+      // Check export const VARIABLE = value
+      ExportNamedDeclaration(p) {
+        if (result) return;
+
+        if (p.node.declaration && t.isVariableDeclaration(p.node.declaration)) {
+          const decl = p.node.declaration;
+          for (const declarator of decl.declarations) {
+            if (t.isIdentifier(declarator.id) && declarator.id.name === exportName) {
+              const init = declarator.init;
+              let valueType = null;
+              let isEditable = false;
+
+              if (t.isStringLiteral(init) || t.isNumericLiteral(init)) {
+                valueType = "literal";
+                isEditable = true;
+              } else if (t.isArrayExpression(init)) {
+                valueType = "array";
+                isEditable = true;
+              } else if (t.isObjectExpression(init)) {
+                valueType = "object";
+                isEditable = true;
+              }
+
+              result = {
+                line: declarator.loc?.start.line || null,
+                valueType,
+                isEditable,
+              };
+              return;
+            }
+          }
+        }
+
+        // Check export { VARIABLE }
+        if (p.node.specifiers) {
+          for (const spec of p.node.specifiers) {
+            if (t.isExportSpecifier(spec) &&
+                t.isIdentifier(spec.exported) &&
+                spec.exported.name === exportName) {
+              // Need to find the original declaration
+              const localName = t.isIdentifier(spec.local) ? spec.local.name : exportName;
+              const binding = p.scope.getBinding(localName);
+              if (binding && binding.path.isVariableDeclarator()) {
+                const init = binding.path.node.init;
+                let valueType = null;
+                let isEditable = false;
+
+                if (t.isStringLiteral(init) || t.isNumericLiteral(init)) {
+                  valueType = "literal";
+                  isEditable = true;
+                } else if (t.isArrayExpression(init)) {
+                  valueType = "array";
+                  isEditable = true;
+                } else if (t.isObjectExpression(init)) {
+                  valueType = "object";
+                  isEditable = true;
+                }
+
+                result = {
+                  line: binding.path.node.loc?.start.line || null,
+                  valueType,
+                  isEditable,
+                };
+              }
+              return;
+            }
+          }
+        }
+      },
+    });
+
+    return result;
+  }
+
+  /**
+   * Extracts expression source info from JSX children and builds metadata attributes
+   */
+  function getExpressionSourceAttributes(jsxElement, state) {
+    const attrs = [];
+    const children = jsxElement.children || [];
+
+    for (const child of children) {
+      if (t.isJSXExpressionContainer(child) && !t.isJSXEmptyExpression(child.expression)) {
+        // We found an expression - analyze it
+        // Note: We need to create a path for the expression, but we only have the node
+        // For now, we'll do basic analysis using the scope from the JSX element
+        const expr = child.expression;
+
+        // Basic classification based on node type
+        if (t.isIdentifier(expr)) {
+          attrs.push({ name: "x-expr-var", value: expr.name });
+        } else if (t.isMemberExpression(expr)) {
+          const propPath = buildPropertyPath(expr);
+          attrs.push({ name: "x-expr-path", value: propPath });
+
+          // Get root object name
+          let root = expr;
+          while (t.isMemberExpression(root.object)) {
+            root = root.object;
+          }
+          if (t.isIdentifier(root.object)) {
+            attrs.push({ name: "x-expr-var", value: root.object.name });
+          }
+        }
+
+        // Only process first expression for now
+        break;
+      }
+    }
+
+    return attrs;
+  }
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
   // ---------- helpers ----------
   const getName = (openingEl) => {
     const n = openingEl?.name;
@@ -400,7 +1196,11 @@ const babelMetadataPlugin = ({ types: t }) => {
 
   const pushMetaAttrs = (
     openingEl,
+<<<<<<< HEAD
     { normalizedPath, lineNumber, elementName, isDynamic },
+=======
+    { normalizedPath, lineNumber, elementName, isDynamic, sourceInfo, arrayContext },
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
     { markExcluded = false } = {},
   ) => {
     if (alreadyHasXMeta(openingEl)) return;
@@ -431,6 +1231,87 @@ const babelMetadataPlugin = ({ types: t }) => {
         t.jsxAttribute(t.jsxIdentifier("x-excluded"), t.stringLiteral("true")),
       );
     }
+<<<<<<< HEAD
+=======
+
+    // Add source tracking attributes if available
+    if (sourceInfo) {
+      // x-source-type: static-local | static-imported | prop | state | computed | external
+      if (sourceInfo.type) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-type"), t.stringLiteral(sourceInfo.type))
+        );
+      }
+
+      // x-source-var: the variable name
+      if (sourceInfo.varName) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-var"), t.stringLiteral(sourceInfo.varName))
+        );
+      }
+
+      // x-source-file: for imports, the import path
+      if (sourceInfo.file) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-file"), t.stringLiteral(sourceInfo.file))
+        );
+      }
+
+      // x-source-file-abs: absolute path for relative imports (needed by backend)
+      if (sourceInfo.absFile) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-file-abs"), t.stringLiteral(sourceInfo.absFile))
+        );
+      }
+
+      // x-source-line: line number in source file
+      if (sourceInfo.line) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-line"), t.stringLiteral(String(sourceInfo.line)))
+        );
+      }
+
+      // x-source-path: for object property access (e.g., "name" or "address.city")
+      if (sourceInfo.path) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-source-path"), t.stringLiteral(sourceInfo.path))
+        );
+      }
+
+      // x-source-editable: whether this dynamic content can be edited
+      metaAttrs.push(
+        t.jsxAttribute(
+          t.jsxIdentifier("x-source-editable"),
+          t.stringLiteral(sourceInfo.isEditable ? "true" : "false")
+        )
+      );
+    }
+
+    // Add array iteration context if available
+    if (arrayContext) {
+      if (arrayContext.arrayVar) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-array-var"), t.stringLiteral(arrayContext.arrayVar))
+        );
+      }
+      if (arrayContext.arrayFile) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-array-file"), t.stringLiteral(arrayContext.arrayFile))
+        );
+      }
+      if (arrayContext.arrayLine) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-array-line"), t.stringLiteral(String(arrayContext.arrayLine)))
+        );
+      }
+      if (arrayContext.itemParam) {
+        metaAttrs.push(
+          t.jsxAttribute(t.jsxIdentifier("x-array-item-param"), t.stringLiteral(arrayContext.itemParam))
+        );
+      }
+    }
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
     insertMetaAttributes(openingEl, metaAttrs);
   };
 
@@ -879,6 +1760,12 @@ const babelMetadataPlugin = ({ types: t }) => {
           }
         }
 
+<<<<<<< HEAD
+=======
+        // Record prop sources for cross-file tracing
+        recordPropSources(elementName, jsxPath, state);
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
         // Get source location
         const filename =
           state.filename ||
@@ -911,6 +1798,51 @@ const babelMetadataPlugin = ({ types: t }) => {
           }
         }
 
+<<<<<<< HEAD
+=======
+        // Analyze expression sources if element has expressions
+        let sourceInfo = null;
+        let arrayContext = null;
+
+        if (isDynamic) {
+          // Find expression children and analyze them
+          const children = jsxPath.node.children || [];
+          for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            if (t.isJSXExpressionContainer(child) && !t.isJSXEmptyExpression(child.expression)) {
+              // Get the path to this expression container
+              const exprContainerPath = jsxPath.get(`children.${i}`);
+              if (exprContainerPath && exprContainerPath.node) {
+                const exprPath = exprContainerPath.get("expression");
+                if (exprPath && exprPath.node) {
+                  sourceInfo = analyzeExpression(exprPath, state);
+                  if (sourceInfo && sourceInfo.arrayContext) {
+                    arrayContext = sourceInfo.arrayContext;
+                  }
+                }
+              }
+              break; // Only analyze first expression
+            }
+          }
+
+          // If no expression children, check if we're in array iteration context
+          if (!sourceInfo) {
+            const iterContext = getArrayIterationContext(jsxPath, state);
+            if (iterContext) {
+              arrayContext = iterContext;
+              sourceInfo = {
+                type: iterContext.isEditable ? "static-imported" : "external",
+                varName: iterContext.arrayVar,
+                file: iterContext.arrayFile,
+                absFile: iterContext.absFile,
+                line: iterContext.arrayLine,
+                isEditable: iterContext.isEditable,
+              };
+            }
+          }
+        }
+
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
         // Check if parent is a detected composite portal
         const parentIsCompositePortal = (() => {
           const p = jsxPath.parentPath;
@@ -942,7 +1874,11 @@ const babelMetadataPlugin = ({ types: t }) => {
         ) {
           pushMetaAttrs(
             openingElement,
+<<<<<<< HEAD
             { normalizedPath, lineNumber, elementName, isDynamic },
+=======
+            { normalizedPath, lineNumber, elementName, isDynamic, sourceInfo, arrayContext },
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
             { markExcluded: true },
           );
           return;
@@ -963,7 +1899,11 @@ const babelMetadataPlugin = ({ types: t }) => {
           // Composite portal: stamp + mark excluded
           pushMetaAttrs(
             openingElement,
+<<<<<<< HEAD
             { normalizedPath, lineNumber, elementName, isDynamic },
+=======
+            { normalizedPath, lineNumber, elementName, isDynamic, sourceInfo, arrayContext },
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
             { markExcluded: true },
           );
           return;
@@ -972,7 +1912,11 @@ const babelMetadataPlugin = ({ types: t }) => {
         // ✅ Normal case: add metadata attributes directly
         pushMetaAttrs(
           openingElement,
+<<<<<<< HEAD
           { normalizedPath, lineNumber, elementName, isDynamic },
+=======
+          { normalizedPath, lineNumber, elementName, isDynamic, sourceInfo, arrayContext },
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
         );
       },
 
@@ -1027,8 +1971,55 @@ const babelMetadataPlugin = ({ types: t }) => {
         const hasExpressions = parentElement && parentElement.node ? hasAnyExpression(parentElement.node) : false;
         const isDynamic = isInArrayMethod || hasExpressions;
 
+<<<<<<< HEAD
         // Add metadata attributes
         insertMetaAttributes(jsxPath.node, [
+=======
+        // Analyze expression sources if element has expressions
+        let sourceInfo = null;
+        let arrayContext = null;
+
+        if (isDynamic && parentElement && parentElement.node) {
+          // Find expression children and analyze them
+          const children = parentElement.node.children || [];
+          for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            if (t.isJSXExpressionContainer(child) && !t.isJSXEmptyExpression(child.expression)) {
+              // Get the path to this expression container
+              const exprContainerPath = parentElement.get(`children.${i}`);
+              if (exprContainerPath && exprContainerPath.node) {
+                const exprPath = exprContainerPath.get("expression");
+                if (exprPath && exprPath.node) {
+                  sourceInfo = analyzeExpression(exprPath, state);
+                  if (sourceInfo && sourceInfo.arrayContext) {
+                    arrayContext = sourceInfo.arrayContext;
+                  }
+                }
+              }
+              break; // Only analyze first expression
+            }
+          }
+
+          // If no expression children, check if we're in array iteration context
+          if (!sourceInfo) {
+            const iterContext = getArrayIterationContext(parentElement, state);
+            if (iterContext) {
+              arrayContext = iterContext;
+              sourceInfo = {
+                type: iterContext.isEditable ? "static-imported" : "external",
+                varName: iterContext.arrayVar,
+                file: iterContext.arrayFile,
+                absFile: iterContext.absFile,
+                line: iterContext.arrayLine,
+                isEditable: iterContext.isEditable,
+              };
+            }
+          }
+        }
+
+        // Build metadata attributes
+        const metaAttrs = [
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
           t.jsxAttribute(
             t.jsxIdentifier("x-file-name"),
             t.stringLiteral(normalizedPath),
@@ -1049,7 +2040,78 @@ const babelMetadataPlugin = ({ types: t }) => {
             t.jsxIdentifier("x-dynamic"),
             t.stringLiteral(isDynamic ? "true" : "false"),
           ),
+<<<<<<< HEAD
         ]);
+=======
+        ];
+
+        // Add source tracking attributes if available
+        if (sourceInfo) {
+          if (sourceInfo.type) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-type"), t.stringLiteral(sourceInfo.type))
+            );
+          }
+          if (sourceInfo.varName) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-var"), t.stringLiteral(sourceInfo.varName))
+            );
+          }
+          if (sourceInfo.file) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-file"), t.stringLiteral(sourceInfo.file))
+            );
+          }
+          if (sourceInfo.absFile) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-file-abs"), t.stringLiteral(sourceInfo.absFile))
+            );
+          }
+          if (sourceInfo.line) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-line"), t.stringLiteral(String(sourceInfo.line)))
+            );
+          }
+          if (sourceInfo.path) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-source-path"), t.stringLiteral(sourceInfo.path))
+            );
+          }
+          metaAttrs.push(
+            t.jsxAttribute(
+              t.jsxIdentifier("x-source-editable"),
+              t.stringLiteral(sourceInfo.isEditable ? "true" : "false")
+            )
+          );
+        }
+
+        // Add array iteration context if available
+        if (arrayContext) {
+          if (arrayContext.arrayVar) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-array-var"), t.stringLiteral(arrayContext.arrayVar))
+            );
+          }
+          if (arrayContext.arrayFile) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-array-file"), t.stringLiteral(arrayContext.arrayFile))
+            );
+          }
+          if (arrayContext.arrayLine) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-array-line"), t.stringLiteral(String(arrayContext.arrayLine)))
+            );
+          }
+          if (arrayContext.itemParam) {
+            metaAttrs.push(
+              t.jsxAttribute(t.jsxIdentifier("x-array-item-param"), t.stringLiteral(arrayContext.itemParam))
+            );
+          }
+        }
+
+        // Add metadata attributes
+        insertMetaAttributes(jsxPath.node, metaAttrs);
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
       },
     },
   };

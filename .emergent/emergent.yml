@@ -1,3 +1,7 @@
 {
+<<<<<<< HEAD
   "env_image_name": "fastapi_react_mongo_shadcn_base_image_cloud_arm:release-27012026-1"
+=======
+  "env_image_name": "fastapi_react_mongo_shadcn_base_image_cloud_arm:release-30012026-1"
+>>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
 }
