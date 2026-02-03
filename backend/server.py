@@ -1,31 +1,18 @@
-<<<<<<< HEAD
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-=======
-from fastapi import FastAPI, APIRouter
->>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-<<<<<<< HEAD
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Literal
+from pydantic import BaseModel, Field
+from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
-import bcrypt
-import jwt
+import httpx
 import random
 import string
-=======
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
-from datetime import datetime, timezone
-
->>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -35,557 +22,871 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-<<<<<<< HEAD
-# JWT configuration
-SECRET_KEY = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+# JWT Secret
+JWT_SECRET = os.environ.get('JWT_SECRET', 'nammayatra_jwt_secret_2025')
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 
 # Create the main app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
-security = HTTPBearer()
 
-# Models
-class UserRole(str):
-    DRIVER = "driver"
-    PASSENGER = "passenger"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class LocationModel(BaseModel):
+# ========================= FARE CONFIGURATION =========================
+BASE_FARE = 30  # ₹30 base fare
+PER_KM_RATE = 15  # ₹15 per km
+FARE_FLEXIBILITY = 0.20  # ±20% flexibility for drivers
+
+# ========================= MODELS =========================
+
+class LocationPoint(BaseModel):
     lat: float
     lng: float
     address: Optional[str] = None
 
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
-    phone: str
-    role: Literal["driver", "passenger"]
-    vehicle_info: Optional[dict] = None
+class RideRequestCreate(BaseModel):
+    pickup: LocationPoint
+    drop: LocationPoint
+    vehicle_type: str = "auto"
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class RideRequest(BaseModel):
-    pickup: LocationModel
-    destination: LocationModel
-    passenger_id: str
-
-class FareProposal(BaseModel):
+class FareProposalCreate(BaseModel):
     ride_id: str
-    proposed_fare: float
-    driver_id: str
+    fare_amount: float
 
-class FareResponse(BaseModel):
-    ride_id: str
-    action: Literal["confirm", "negotiate", "cancel"]
-    counter_offer: Optional[float] = None
+class CounterOfferCreate(BaseModel):
+    proposal_id: str
+    counter_amount: float
 
-class ChatMessage(BaseModel):
+class ChatMessageCreate(BaseModel):
     ride_id: str
-    sender_id: str
+    receiver_id: str
     message: str
-    message_type: Literal["text", "fare_proposal", "fare_confirmed"] = "text"
-    fare_amount: Optional[float] = None
+    original_language: str = "en"
+    target_language: str = "en"
 
-class LocationUpdate(BaseModel):
-    user_id: str
-    location: LocationModel
+class DriverLocationUpdate(BaseModel):
+    lat: float
+    lng: float
 
-class OTPVerification(BaseModel):
+class BookRideRequest(BaseModel):
+    proposal_id: str
+
+class OTPVerify(BaseModel):
     ride_id: str
     otp: str
 
-# Helper functions
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+class EmergencyContactCreate(BaseModel):
+    name: str
+    phone: str
+    relationship: str
 
-def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+class SOSAlertCreate(BaseModel):
+    ride_id: Optional[str] = None
+    location_lat: float
+    location_lng: float
+    message: Optional[str] = None
 
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+class ScheduledRideCreate(BaseModel):
+    pickup: LocationPoint
+    drop: LocationPoint
+    vehicle_type: str = "auto"
+    scheduled_time: str
+    notes: Optional[str] = None
 
-def decode_token(token: str) -> dict:
+class RideRatingCreate(BaseModel):
+    ride_id: str
+    rating: int
+    feedback: Optional[str] = None
+
+class PaymentOrderCreate(BaseModel):
+    ride_id: str
+    amount: float
+
+class PaymentVerify(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+    ride_id: str
+
+# ========================= ROUTING & FARE CALCULATION =========================
+
+async def get_route_from_osrm(pickup: LocationPoint, drop: LocationPoint) -> dict:
+    """Get actual driving route from OSRM (Open Source Routing Machine)"""
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        # OSRM expects coordinates as lng,lat
+        url = f"https://router.project-osrm.org/route/v1/driving/{pickup.lng},{pickup.lat};{drop.lng},{drop.lat}"
+        params = {
+            "overview": "full",
+            "geometries": "geojson",
+            "steps": "false"
+        }
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, params=params)
+            data = response.json()
+            
+            if data.get("code") == "Ok" and data.get("routes"):
+                route = data["routes"][0]
+                distance_meters = route["distance"]
+                duration_seconds = route["duration"]
+                geometry = route["geometry"]  # GeoJSON LineString
+                
+                return {
+                    "distance_km": round(distance_meters / 1000, 2),
+                    "duration_minutes": round(duration_seconds / 60, 1),
+                    "route_geometry": geometry,
+                    "success": True
+                }
+    except Exception as e:
+        logger.error(f"OSRM routing error: {e}")
+    
+    # Fallback to straight-line distance if OSRM fails
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371  # Earth's radius in km
+    lat1, lon1 = radians(pickup.lat), radians(pickup.lng)
+    lat2, lon2 = radians(drop.lat), radians(drop.lng)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    distance = R * c
+    
+    # Multiply by 1.3 to approximate road distance
+    road_distance = distance * 1.3
+    
+    return {
+        "distance_km": round(road_distance, 2),
+        "duration_minutes": round(road_distance * 2.5, 1),  # Assume ~24 km/h avg speed
+        "route_geometry": None,
+        "success": False
+    }
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = decode_token(token)
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
+def calculate_fare(distance_km: float) -> dict:
+    """Calculate fare based on actual road distance"""
+    base_fare = BASE_FARE + (PER_KM_RATE * distance_km)
+    base_fare = round(base_fare, 2)
+    min_fare = round(base_fare * (1 - FARE_FLEXIBILITY), 2)
+    max_fare = round(base_fare * (1 + FARE_FLEXIBILITY), 2)
+    
+    return {
+        "base_fare": base_fare,
+        "min_fare": min_fare,
+        "max_fare": max_fare
+    }
 
 def generate_otp() -> str:
-    return ''.join(random.choices(string.digits, k=6))
+    return ''.join(random.choices(string.digits, k=4))
 
-# Routes
-@api_router.get("/")
-async def root():
-    return {"message": "RideFlow API"}
+# ========================= AUTH HELPERS =========================
 
-@api_router.post("/auth/register")
-async def register(request: RegisterRequest):
-    # Check if user exists
-    existing_user = await db.users.find_one({"email": request.email})
+async def get_current_user(request: Request) -> dict:
+    session_token = request.cookies.get("session_token")
+    if not session_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            session_token = auth_header.split(" ")[1]
+    
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    session = await db.user_sessions.find_one({"session_token": session_token}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    
+    expires_at = session.get("expires_at")
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
+    
+    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return user
+
+# ========================= AUTH ROUTES =========================
+
+@api_router.get("/auth/session")
+async def exchange_session(request: Request, response: Response):
+    session_id = request.headers.get("X-Session-ID")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Session ID required")
+    
+    async with httpx.AsyncClient() as client_http:
+        resp = await client_http.get(
+            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+            headers={"X-Session-ID": session_id}
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid session ID")
+        data = resp.json()
+    
+    existing_user = await db.users.find_one({"email": data["email"]}, {"_id": 0})
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    user_id = str(uuid.uuid4())
-    user_doc = {
-        "id": user_id,
-        "email": request.email,
-        "password": hash_password(request.password),
-        "name": request.name,
-        "phone": request.phone,
-        "role": request.role,
-        "vehicle_info": request.vehicle_info if request.role == "driver" else None,
-        "current_location": None,
-        "is_active": True,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    print(user_doc)
-    
-    await db.users.insert_one(user_doc)
-    
-    token = create_access_token({"sub": user_id, "email": request.email, "role": request.role})
-    
-    return {
-        "token": token,
-        "user": {
-            "id": user_id,
-            "email": request.email,
-            "name": request.name,
-            "phone": request.phone,
-            "role": request.role,
+        user_id = existing_user["user_id"]
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": data["name"], "picture": data.get("picture")}}
+        )
+    else:
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        new_user = {
+            "user_id": user_id,
+            "name": data["name"],
+            "email": data["email"],
+            "picture": data.get("picture"),
+            "user_type": "passenger",
+            "preferred_language": "en",
+            "phone": None,
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
-    }
-
-@api_router.post("/auth/login")
-async def login(request: LoginRequest):
-    user = await db.users.find_one({"email": request.email})
-    if not user or not verify_password(request.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        await db.users.insert_one(new_user)
     
-    token = create_access_token({"sub": user["id"], "email": user["email"], "role": user["role"]})
+    session_token = data.get("session_token", f"sess_{uuid.uuid4().hex}")
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     
-    return {
-        "token": token,
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "name": user["name"],
-            "phone": user["phone"],
-            "role": user["role"],
-            "vehicle_info": user.get("vehicle_info"),
-        }
-    }
+    await db.user_sessions.delete_many({"user_id": user_id})
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    response.set_cookie(
+        key="session_token", value=session_token, httponly=True,
+        secure=True, samesite="none", path="/", max_age=7*24*60*60
+    )
+    
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    return user
 
 @api_router.get("/auth/me")
-async def get_me(current_user: dict = Depends(get_current_user)):
-    return {
-        "id": current_user["id"],
-        "email": current_user["email"],
-        "name": current_user["name"],
-        "phone": current_user["phone"],
-        "role": current_user["role"],
-        "vehicle_info": current_user.get("vehicle_info"),
-        "current_location": current_user.get("current_location"),
-    }
+async def get_me(user: dict = Depends(get_current_user)):
+    return user
+
+@api_router.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    session_token = request.cookies.get("session_token")
+    if session_token:
+        await db.user_sessions.delete_many({"session_token": session_token})
+    response.delete_cookie("session_token", path="/")
+    return {"message": "Logged out"}
+
+@api_router.put("/auth/profile")
+async def update_profile(
+    phone: Optional[str] = None,
+    user_type: Optional[str] = None,
+    preferred_language: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    update_data = {}
+    if phone:
+        update_data["phone"] = phone
+    if user_type in ["passenger", "driver"]:
+        update_data["user_type"] = user_type
+    if preferred_language:
+        update_data["preferred_language"] = preferred_language
+    
+    if update_data:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": update_data})
+    
+    updated_user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return updated_user
+
+# ========================= RIDE ROUTES =========================
 
 @api_router.post("/rides/request")
-async def request_ride(request: RideRequest, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "passenger":
-        raise HTTPException(status_code=403, detail="Only passengers can request rides")
+async def create_ride_request(data: RideRequestCreate, user: dict = Depends(get_current_user)):
+    """Create a new ride request with actual route calculation"""
+    ride_id = f"ride_{uuid.uuid4().hex[:12]}"
     
-    ride_id = str(uuid.uuid4())
-    ride_doc = {
-        "id": ride_id,
-        "passenger_id": current_user["id"],
-        "passenger_name": current_user["name"],
-        "passenger_phone": current_user["phone"],
-        "pickup": request.pickup.model_dump(),
-        "destination": request.destination.model_dump(),
+    # Get actual route from OSRM
+    route_info = await get_route_from_osrm(data.pickup, data.drop)
+    distance_km = route_info["distance_km"]
+    
+    # Calculate fare based on actual road distance
+    fare_info = calculate_fare(distance_km)
+    
+    ride = {
+        "ride_id": ride_id,
+        "passenger_id": user["user_id"],
+        "passenger_name": user["name"],
+        "passenger_phone": user.get("phone"),
+        "pickup": data.pickup.model_dump(),
+        "drop": data.drop.model_dump(),
+        "vehicle_type": data.vehicle_type,
         "status": "pending",
-        "driver_id": None,
-        "proposed_fare": None,
-        "agreed_fare": None,
+        "distance_km": distance_km,
+        "duration_minutes": route_info["duration_minutes"],
+        "route_geometry": route_info["route_geometry"],
+        "base_fare": fare_info["base_fare"],
+        "min_fare": fare_info["min_fare"],
+        "max_fare": fare_info["max_fare"],
         "otp": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "started_at": None,
-        "completed_at": None,
+        "booked_proposal_id": None,
+        "payment_status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     
-    await db.rides.insert_one(ride_doc)
+    await db.rides.insert_one(ride)
+    ride.pop("_id", None)
     
-    return {"ride_id": ride_id, "message": "Ride requested successfully", "status": "pending"}
+    # Hide fare flexibility from passenger
+    response = {k: v for k, v in ride.items() if k not in ["min_fare", "max_fare"]}
+    return response
 
-@api_router.get("/rides/available")
-async def get_available_rides(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "driver":
-        raise HTTPException(status_code=403, detail="Only drivers can view available rides")
-    
-    rides = await db.rides.find(
-        {"status": "pending"},
-        {"_id": 0}
-    ).to_list(100)
-    
-    return {"rides": rides}
-
-@api_router.get("/rides/my-rides")
-async def get_my_rides(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] == "driver":
-        query = {"driver_id": current_user["id"]}
+@api_router.get("/rides/active")
+async def get_active_rides(user: dict = Depends(get_current_user)):
+    if user["user_type"] == "passenger":
+        rides = await db.rides.find(
+            {"passenger_id": user["user_id"], "status": {"$nin": ["completed", "cancelled"]}},
+            {"_id": 0, "min_fare": 0, "max_fare": 0}
+        ).to_list(100)
     else:
-        query = {"passenger_id": current_user["id"]}
-    
-    rides = await db.rides.find(query, {"_id": 0}).sort("created_at", -1).to_list(50)
-    
-    return {"rides": rides}
+        rides = await db.rides.find(
+            {"driver_id": user["user_id"], "status": {"$in": ["booked", "in_progress"]}},
+            {"_id": 0}
+        ).to_list(100)
+    return rides
 
 @api_router.get("/rides/{ride_id}")
-async def get_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
-    ride = await db.rides.find_one({"id": ride_id}, {"_id": 0})
+async def get_ride(ride_id: str, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
     
-    # Check if user is part of this ride
-    if ride.get("passenger_id") != current_user["id"] and ride.get("driver_id") != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
+    # Hide fare flexibility from passengers
+    if user["user_type"] == "passenger" or ride.get("passenger_id") == user["user_id"]:
+        ride.pop("min_fare", None)
+        ride.pop("max_fare", None)
     
     return ride
 
-@api_router.post("/rides/propose-fare")
-async def propose_fare(proposal: FareProposal, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "driver":
-        raise HTTPException(status_code=403, detail="Only drivers can propose fares")
-    
-    ride = await db.rides.find_one({"id": proposal.ride_id})
+@api_router.get("/rides/{ride_id}/route")
+async def get_ride_route(ride_id: str, user: dict = Depends(get_current_user)):
+    """Get the route geometry for a ride"""
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
-    
-    if ride["status"] != "pending":
-        raise HTTPException(status_code=400, detail="Ride is not available for fare proposal")
-    
-    # Update ride with fare proposal and driver
-    await db.rides.update_one(
-        {"id": proposal.ride_id},
-        {
-            "$set": {
-                "driver_id": current_user["id"],
-                "driver_name": current_user["name"],
-                "driver_phone": current_user["phone"],
-                "driver_vehicle": current_user.get("vehicle_info"),
-                "proposed_fare": proposal.proposed_fare,
-                "status": "fare_proposed",
-            }
-        }
-    )
-    
-    # Create chat message for fare proposal
-    message_doc = {
-        "id": str(uuid.uuid4()),
-        "ride_id": proposal.ride_id,
-        "sender_id": current_user["id"],
-        "sender_name": current_user["name"],
-        "sender_role": current_user["role"],
-        "message": f"Proposed fare: ${proposal.proposed_fare:.2f}",
-        "message_type": "fare_proposal",
-        "fare_amount": proposal.proposed_fare,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.messages.insert_one(message_doc)
-    
-    return {"message": "Fare proposed successfully", "proposed_fare": proposal.proposed_fare}
-
-@api_router.post("/rides/respond-fare")
-async def respond_to_fare(response: FareResponse, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "passenger":
-        raise HTTPException(status_code=403, detail="Only passengers can respond to fare")
-    
-    ride = await db.rides.find_one({"id": response.ride_id})
-    if not ride:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    
-    if ride["passenger_id"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if response.action == "confirm":
-        # Generate OTP and start ride
-        otp = generate_otp()
-        await db.rides.update_one(
-            {"id": response.ride_id},
-            {
-                "$set": {
-                    "status": "in_progress",
-                    "agreed_fare": ride["proposed_fare"],
-                    "otp": otp,
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                }
-            }
-        )
-        
-        # Create chat message
-        message_doc = {
-            "id": str(uuid.uuid4()),
-            "ride_id": response.ride_id,
-            "sender_id": current_user["id"],
-            "sender_name": current_user["name"],
-            "sender_role": current_user["role"],
-            "message": f"Fare confirmed at ${ride['proposed_fare']:.2f}",
-            "message_type": "fare_confirmed",
-            "fare_amount": ride["proposed_fare"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        await db.messages.insert_one(message_doc)
-        
-        return {"message": "Ride confirmed and started", "otp": otp, "status": "in_progress"}
-    
-    elif response.action == "negotiate":
-        # Update status to negotiating
-        await db.rides.update_one(
-            {"id": response.ride_id},
-            {"$set": {"status": "negotiating"}}
-        )
-        
-        if response.counter_offer:
-            # Create chat message with counter offer
-            message_doc = {
-                "id": str(uuid.uuid4()),
-                "ride_id": response.ride_id,
-                "sender_id": current_user["id"],
-                "sender_name": current_user["name"],
-                "sender_role": current_user["role"],
-                "message": f"Counter offer: ${response.counter_offer:.2f}",
-                "message_type": "fare_proposal",
-                "fare_amount": response.counter_offer,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            await db.messages.insert_one(message_doc)
-        
-        return {"message": "Negotiation started", "status": "negotiating"}
-    
-    else:  # cancel
-        await db.rides.update_one(
-            {"id": response.ride_id},
-            {"$set": {"status": "cancelled", "driver_id": None, "proposed_fare": None}}
-        )
-        
-        return {"message": "Ride cancelled", "status": "cancelled"}
-
-@api_router.post("/rides/update-fare")
-async def update_fare(proposal: FareProposal, current_user: dict = Depends(get_current_user)):
-    ride = await db.rides.find_one({"id": proposal.ride_id})
-    if not ride:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    
-    # Update proposed fare
-    await db.rides.update_one(
-        {"id": proposal.ride_id},
-        {"$set": {"proposed_fare": proposal.proposed_fare, "status": "fare_proposed"}}
-    )
-    
-    # Create chat message
-    message_doc = {
-        "id": str(uuid.uuid4()),
-        "ride_id": proposal.ride_id,
-        "sender_id": current_user["id"],
-        "sender_name": current_user["name"],
-        "sender_role": current_user["role"],
-        "message": f"New fare offer: ${proposal.proposed_fare:.2f}",
-        "message_type": "fare_proposal",
-        "fare_amount": proposal.proposed_fare,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.messages.insert_one(message_doc)
-    
-    return {"message": "Fare updated", "proposed_fare": proposal.proposed_fare}
-
-@api_router.post("/chat/send")
-async def send_message(message: ChatMessage, current_user: dict = Depends(get_current_user)):
-    ride = await db.rides.find_one({"id": message.ride_id})
-    if not ride:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    
-    message_doc = {
-        "id": str(uuid.uuid4()),
-        "ride_id": message.ride_id,
-        "sender_id": current_user["id"],
-        "sender_name": current_user["name"],
-        "sender_role": current_user["role"],
-        "message": message.message,
-        "message_type": message.message_type,
-        "fare_amount": message.fare_amount,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    
-    await db.messages.insert_one(message_doc)
-    
-    return {"message_id": message_doc["id"], "timestamp": message_doc["timestamp"]}
-
-@api_router.get("/chat/{ride_id}")
-async def get_messages(ride_id: str, current_user: dict = Depends(get_current_user)):
-    ride = await db.rides.find_one({"id": ride_id})
-    if not ride:
-        raise HTTPException(status_code=404, detail="Ride not found")
-    
-    messages = await db.messages.find(
-        {"ride_id": ride_id},
-        {"_id": 0}
-    ).sort("timestamp", 1).to_list(500)
-    
-    return {"messages": messages}
-
-@api_router.post("/location/update")
-async def update_location(update: LocationUpdate, current_user: dict = Depends(get_current_user)):
-    await db.users.update_one(
-        {"id": current_user["id"]},
-        {
-            "$set": {
-                "current_location": update.location.model_dump(),
-                "location_updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        }
-    )
-    
-    return {"message": "Location updated"}
-
-@api_router.get("/location/{user_id}")
-async def get_location(user_id: str, current_user: dict = Depends(get_current_user)):
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
     
     return {
-        "user_id": user_id,
-        "current_location": user.get("current_location"),
-        "location_updated_at": user.get("location_updated_at"),
+        "route_geometry": ride.get("route_geometry"),
+        "distance_km": ride.get("distance_km"),
+        "duration_minutes": ride.get("duration_minutes"),
+        "pickup": ride.get("pickup"),
+        "drop": ride.get("drop")
     }
+
+@api_router.get("/rides/{ride_id}/proposals")
+async def get_ride_proposals(ride_id: str, user: dict = Depends(get_current_user)):
+    proposals = await db.fare_proposals.find(
+        {"ride_id": ride_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+    return proposals
+
+@api_router.post("/rides/{ride_id}/cancel")
+async def cancel_ride(ride_id: str, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride["passenger_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    await db.rides.update_one({"ride_id": ride_id}, {"$set": {"status": "cancelled"}})
+    return {"message": "Ride cancelled"}
+
+@api_router.get("/rides/history/all")
+async def get_ride_history(user: dict = Depends(get_current_user)):
+    if user["user_type"] == "passenger":
+        rides = await db.rides.find(
+            {"passenger_id": user["user_id"]}, {"_id": 0, "min_fare": 0, "max_fare": 0}
+        ).sort("created_at", -1).to_list(100)
+    else:
+        rides = await db.rides.find(
+            {"driver_id": user["user_id"]}, {"_id": 0}
+        ).sort("created_at", -1).to_list(100)
+    return rides
+
+@api_router.post("/rides/book")
+async def book_ride(data: BookRideRequest, user: dict = Depends(get_current_user)):
+    proposal = await db.fare_proposals.find_one({"proposal_id": data.proposal_id}, {"_id": 0})
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    
+    ride = await db.rides.find_one({"ride_id": proposal["ride_id"]}, {"_id": 0})
+    if ride["passenger_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    otp = generate_otp()
+    
+    await db.rides.update_one(
+        {"ride_id": proposal["ride_id"]},
+        {"$set": {
+            "status": "booked",
+            "booked_proposal_id": data.proposal_id,
+            "driver_id": proposal["driver_id"],
+            "driver_name": proposal["driver_name"],
+            "driver_phone": proposal.get("driver_phone"),
+            "final_fare": proposal["fare_amount"],
+            "otp": otp,
+            "booked_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    await db.fare_proposals.update_one({"proposal_id": data.proposal_id}, {"$set": {"status": "accepted"}})
+    await db.fare_proposals.update_many(
+        {"ride_id": proposal["ride_id"], "proposal_id": {"$ne": data.proposal_id}},
+        {"$set": {"status": "rejected"}}
+    )
+    
+    updated_ride = await db.rides.find_one({"ride_id": proposal["ride_id"]}, {"_id": 0, "min_fare": 0, "max_fare": 0})
+    return updated_ride
 
 @api_router.post("/rides/verify-otp")
-async def verify_otp(verification: OTPVerification, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "driver":
-        raise HTTPException(status_code=403, detail="Only drivers can verify OTP")
-    
-    ride = await db.rides.find_one({"id": verification.ride_id})
+async def verify_otp(data: OTPVerify, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": data.ride_id}, {"_id": 0})
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
-    
-    if ride["driver_id"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if ride["otp"] != verification.otp:
+    if ride.get("driver_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if ride.get("otp") != data.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
-    # Complete the ride
     await db.rides.update_one(
-        {"id": verification.ride_id},
-        {
-            "$set": {
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }
-        }
+        {"ride_id": data.ride_id},
+        {"$set": {"status": "in_progress", "started_at": datetime.now(timezone.utc).isoformat()}}
     )
-    
-    return {"message": "Ride completed successfully", "status": "completed"}
+    return {"message": "OTP verified, ride started"}
 
-@api_router.post("/payment/process")
-async def process_payment(ride_id: str, current_user: dict = Depends(get_current_user)):
-    ride = await db.rides.find_one({"id": ride_id})
+@api_router.post("/rides/{ride_id}/complete")
+async def complete_ride(ride_id: str, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("driver_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    await db.rides.update_one(
+        {"ride_id": ride_id},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    await db.driver_profiles.update_one({"user_id": user["user_id"]}, {"$inc": {"total_rides": 1}})
+    return {"message": "Ride completed"}
+
+# ========================= DRIVER ROUTES =========================
+
+@api_router.get("/driver/nearby-rides")
+async def get_nearby_rides(lat: float, lng: float, user: dict = Depends(get_current_user)):
+    if user["user_type"] != "driver":
+        raise HTTPException(status_code=403, detail="Only drivers can view nearby rides")
+    
+    rides = await db.rides.find({"status": "pending"}, {"_id": 0}).to_list(100)
+    
+    from math import radians, sin, cos, sqrt, atan2
+    def haversine(lat1, lon1, lat2, lon2):
+        R = 6371
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        dlat, dlon = lat2 - lat1, lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        return R * 2 * atan2(sqrt(a), sqrt(1-a))
+    
+    nearby_rides = []
+    for ride in rides:
+        pickup = ride["pickup"]
+        distance = haversine(lat, lng, pickup["lat"], pickup["lng"])
+        if distance <= 20:
+            ride["distance_from_driver"] = round(distance, 2)
+            nearby_rides.append(ride)
+    
+    return sorted(nearby_rides, key=lambda x: x["distance_from_driver"])
+
+@api_router.post("/driver/propose-fare")
+async def propose_fare(data: FareProposalCreate, user: dict = Depends(get_current_user)):
+    if user["user_type"] != "driver":
+        raise HTTPException(status_code=403, detail="Only drivers can propose fares")
+    
+    ride = await db.rides.find_one({"ride_id": data.ride_id}, {"_id": 0})
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
     
-    if ride["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Ride must be completed before payment")
+    max_fare = ride.get("max_fare")
+    if max_fare and data.fare_amount > max_fare:
+        raise HTTPException(status_code=400, detail=f"Fare cannot exceed ₹{max_fare}")
     
-    # Mock payment processing
-    payment_id = str(uuid.uuid4())
-    payment_doc = {
-        "id": payment_id,
-        "ride_id": ride_id,
-        "amount": ride["agreed_fare"],
-        "passenger_id": ride["passenger_id"],
-        "driver_id": ride["driver_id"],
-        "status": "completed",
-        "payment_method": "mock",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+    existing = await db.fare_proposals.find_one({
+        "ride_id": data.ride_id, "driver_id": user["user_id"]
+    })
+    
+    if existing:
+        await db.fare_proposals.update_one(
+            {"proposal_id": existing["proposal_id"]},
+            {"$set": {"fare_amount": data.fare_amount, "status": "pending"}}
+        )
+        updated = await db.fare_proposals.find_one({"proposal_id": existing["proposal_id"]}, {"_id": 0})
+        return updated
+    
+    proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
+    driver_info = await db.driver_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    
+    proposal = {
+        "proposal_id": proposal_id,
+        "ride_id": data.ride_id,
+        "driver_id": user["user_id"],
+        "driver_name": user["name"],
+        "driver_phone": user.get("phone"),
+        "driver_rating": driver_info.get("rating", 4.5) if driver_info else 4.5,
+        "fare_amount": data.fare_amount,
+        "status": "pending",
+        "vehicle_type": driver_info.get("vehicle_type", "auto") if driver_info else "auto",
+        "vehicle_number": driver_info.get("vehicle_number") if driver_info else None,
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     
-    await db.payments.insert_one(payment_doc)
-    await db.rides.update_one(
-        {"id": ride_id},
-        {"$set": {"payment_status": "paid", "payment_id": payment_id}}
+    await db.fare_proposals.insert_one(proposal)
+    await db.rides.update_one({"ride_id": data.ride_id}, {"$set": {"status": "proposals"}})
+    
+    proposal.pop("_id", None)
+    return proposal
+
+@api_router.post("/driver/update-location")
+async def update_driver_location(data: DriverLocationUpdate, user: dict = Depends(get_current_user)):
+    if user["user_type"] != "driver":
+        raise HTTPException(status_code=403, detail="Only drivers can update location")
+    
+    await db.driver_locations.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {
+            "user_id": user["user_id"],
+            "lat": data.lat, "lng": data.lng,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }},
+        upsert=True
     )
+    return {"message": "Location updated"}
+
+@api_router.put("/driver/profile")
+async def update_driver_profile(vehicle_type: str, vehicle_number: str, user: dict = Depends(get_current_user)):
+    await db.driver_profiles.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {
+            "user_id": user["user_id"],
+            "vehicle_type": vehicle_type,
+            "vehicle_number": vehicle_number,
+            "rating": 4.5,
+            "total_rides": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }},
+        upsert=True
+    )
+    return {"message": "Profile updated"}
+
+@api_router.get("/driver/profile")
+async def get_driver_profile(user: dict = Depends(get_current_user)):
+    profile = await db.driver_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return profile or {}
+
+@api_router.get("/rides/{ride_id}/driver-location")
+async def get_driver_location_for_ride(ride_id: str, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
     
-    return {"payment_id": payment_id, "message": "Payment processed successfully", "amount": ride["agreed_fare"]}
-
-# Include router
-=======
-# Create the main app without a prefix
-app = FastAPI()
-
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
-
-
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+    driver_id = ride.get("driver_id")
+    if not driver_id:
+        raise HTTPException(status_code=404, detail="No driver assigned")
     
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    location = await db.driver_locations.find_one({"user_id": driver_id}, {"_id": 0})
+    if not location:
+        raise HTTPException(status_code=404, detail="Driver location not available")
+    
+    return location
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+# ========================= NEGOTIATION ROUTES =========================
 
-# Add your routes to the router instead of directly to app
+@api_router.post("/negotiate/counter-offer")
+async def create_counter_offer(data: CounterOfferCreate, user: dict = Depends(get_current_user)):
+    proposal = await db.fare_proposals.find_one({"proposal_id": data.proposal_id}, {"_id": 0})
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    
+    ride = await db.rides.find_one({"ride_id": proposal["ride_id"]}, {"_id": 0})
+    if ride["passenger_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    await db.fare_proposals.update_one(
+        {"proposal_id": data.proposal_id},
+        {"$set": {
+            "counter_amount": data.counter_amount,
+            "status": "countered",
+            "countered_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    await db.rides.update_one({"ride_id": proposal["ride_id"]}, {"$set": {"status": "negotiating"}})
+    
+    updated = await db.fare_proposals.find_one({"proposal_id": data.proposal_id}, {"_id": 0})
+    return updated
+
+# ========================= CHAT ROUTES =========================
+
+@api_router.post("/chat/send")
+async def send_message(data: ChatMessageCreate, user: dict = Depends(get_current_user)):
+    message_id = f"msg_{uuid.uuid4().hex[:12]}"
+    
+    translated_message = None
+    if data.original_language != data.target_language and EMERGENT_LLM_KEY:
+        try:
+            from emergentintegrations.llm.chat import LlmChat, UserMessage
+            chat = LlmChat(
+                api_key=EMERGENT_LLM_KEY,
+                session_id=f"translate_{message_id}",
+                system_message="You are a translator. Translate accurately. Only return the translation."
+            ).with_model("openai", "gpt-5.2")
+            
+            lang_map = {"en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "kn": "Kannada", "bn": "Bengali"}
+            user_msg = UserMessage(text=f"Translate from {lang_map.get(data.original_language, 'English')} to {lang_map.get(data.target_language, 'English')}: {data.message}")
+            translated_message = await chat.send_message(user_msg)
+        except Exception as e:
+            logger.error(f"Translation error: {e}")
+            translated_message = data.message
+    
+    msg = {
+        "message_id": message_id,
+        "ride_id": data.ride_id,
+        "sender_id": user["user_id"],
+        "sender_name": user["name"],
+        "receiver_id": data.receiver_id,
+        "message": data.message,
+        "translated_message": translated_message,
+        "original_language": data.original_language,
+        "target_language": data.target_language,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.chat_messages.insert_one(msg)
+    msg.pop("_id", None)
+    return msg
+
+@api_router.get("/chat/{ride_id}")
+async def get_chat_messages(ride_id: str, user: dict = Depends(get_current_user)):
+    messages = await db.chat_messages.find({"ride_id": ride_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return messages
+
+# ========================= EMERGENCY ROUTES =========================
+
+@api_router.post("/emergency/contacts")
+async def add_emergency_contact(data: EmergencyContactCreate, user: dict = Depends(get_current_user)):
+    contact_id = f"contact_{uuid.uuid4().hex[:12]}"
+    contact = {
+        "contact_id": contact_id,
+        "user_id": user["user_id"],
+        "name": data.name,
+        "phone": data.phone,
+        "relationship": data.relationship,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.emergency_contacts.insert_one(contact)
+    contact.pop("_id", None)
+    return contact
+
+@api_router.get("/emergency/contacts")
+async def get_emergency_contacts(user: dict = Depends(get_current_user)):
+    contacts = await db.emergency_contacts.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(10)
+    return contacts
+
+@api_router.delete("/emergency/contacts/{contact_id}")
+async def delete_emergency_contact(contact_id: str, user: dict = Depends(get_current_user)):
+    result = await db.emergency_contacts.delete_one({"contact_id": contact_id, "user_id": user["user_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return {"message": "Contact deleted"}
+
+@api_router.post("/emergency/sos")
+async def trigger_sos(data: SOSAlertCreate, user: dict = Depends(get_current_user)):
+    alert_id = f"sos_{uuid.uuid4().hex[:12]}"
+    contacts = await db.emergency_contacts.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(10)
+    
+    alert = {
+        "alert_id": alert_id,
+        "user_id": user["user_id"],
+        "user_name": user["name"],
+        "location": {"lat": data.location_lat, "lng": data.location_lng},
+        "message": data.message,
+        "status": "active",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.sos_alerts.insert_one(alert)
+    
+    maps_link = f"https://www.google.com/maps?q={data.location_lat},{data.location_lng}"
+    
+    return {
+        "alert_id": alert_id,
+        "status": "alert_created",
+        "location_link": maps_link,
+        "emergency_numbers": {"police": "100", "ambulance": "102", "women_helpline": "1091", "emergency": "112"},
+        "emergency_contacts": contacts
+    }
+
+# ========================= SCHEDULED RIDES =========================
+
+@api_router.post("/rides/schedule")
+async def create_scheduled_ride(data: ScheduledRideCreate, user: dict = Depends(get_current_user)):
+    scheduled_id = f"sched_{uuid.uuid4().hex[:12]}"
+    
+    try:
+        scheduled_dt = datetime.fromisoformat(data.scheduled_time.replace('Z', '+00:00'))
+    except:
+        raise HTTPException(status_code=400, detail="Invalid datetime format")
+    
+    if scheduled_dt < datetime.now(timezone.utc) + timedelta(minutes=30):
+        raise HTTPException(status_code=400, detail="Must be at least 30 min in future")
+    
+    # Get route for scheduled ride
+    route_info = await get_route_from_osrm(data.pickup, data.drop)
+    
+    scheduled_ride = {
+        "scheduled_id": scheduled_id,
+        "passenger_id": user["user_id"],
+        "passenger_name": user["name"],
+        "pickup": data.pickup.model_dump(),
+        "drop": data.drop.model_dump(),
+        "vehicle_type": data.vehicle_type,
+        "scheduled_time": scheduled_dt.isoformat(),
+        "notes": data.notes,
+        "status": "scheduled",
+        "distance_km": route_info["distance_km"],
+        "duration_minutes": route_info["duration_minutes"],
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.scheduled_rides.insert_one(scheduled_ride)
+    scheduled_ride.pop("_id", None)
+    return scheduled_ride
+
+@api_router.get("/rides/scheduled")
+async def get_scheduled_rides(user: dict = Depends(get_current_user)):
+    scheduled = await db.scheduled_rides.find(
+        {"passenger_id": user["user_id"], "status": {"$in": ["scheduled", "active"]}},
+        {"_id": 0}
+    ).sort("scheduled_time", 1).to_list(50)
+    return scheduled
+
+@api_router.post("/rides/scheduled/{scheduled_id}/cancel")
+async def cancel_scheduled_ride(scheduled_id: str, user: dict = Depends(get_current_user)):
+    scheduled = await db.scheduled_rides.find_one({"scheduled_id": scheduled_id}, {"_id": 0})
+    if not scheduled or scheduled["passenger_id"] != user["user_id"]:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    await db.scheduled_rides.update_one(
+        {"scheduled_id": scheduled_id},
+        {"$set": {"status": "cancelled"}}
+    )
+    return {"message": "Cancelled"}
+
+@api_router.post("/rides/scheduled/{scheduled_id}/activate")
+async def activate_scheduled_ride(scheduled_id: str, user: dict = Depends(get_current_user)):
+    scheduled = await db.scheduled_rides.find_one({"scheduled_id": scheduled_id}, {"_id": 0})
+    if not scheduled or scheduled["passenger_id"] != user["user_id"]:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    ride_id = f"ride_{uuid.uuid4().hex[:12]}"
+    
+    # Get fresh route
+    pickup = LocationPoint(**scheduled["pickup"])
+    drop = LocationPoint(**scheduled["drop"])
+    route_info = await get_route_from_osrm(pickup, drop)
+    fare_info = calculate_fare(route_info["distance_km"])
+    
+    ride = {
+        "ride_id": ride_id,
+        "passenger_id": user["user_id"],
+        "passenger_name": user["name"],
+        "pickup": scheduled["pickup"],
+        "drop": scheduled["drop"],
+        "vehicle_type": scheduled["vehicle_type"],
+        "status": "pending",
+        "distance_km": route_info["distance_km"],
+        "duration_minutes": route_info["duration_minutes"],
+        "route_geometry": route_info["route_geometry"],
+        "base_fare": fare_info["base_fare"],
+        "min_fare": fare_info["min_fare"],
+        "max_fare": fare_info["max_fare"],
+        "otp": None,
+        "payment_status": "pending",
+        "scheduled_id": scheduled_id,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.rides.insert_one(ride)
+    await db.scheduled_rides.update_one({"scheduled_id": scheduled_id}, {"$set": {"status": "active", "ride_id": ride_id}})
+    
+    ride.pop("_id", None)
+    ride.pop("min_fare", None)
+    ride.pop("max_fare", None)
+    return ride
+
+# ========================= RATING ROUTES =========================
+
+@api_router.post("/rides/{ride_id}/rate")
+async def rate_ride(ride_id: str, data: RideRatingCreate, user: dict = Depends(get_current_user)):
+    ride = await db.rides.find_one({"ride_id": ride_id}, {"_id": 0})
+    if not ride or ride["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Can only rate completed rides")
+    
+    if data.rating < 1 or data.rating > 5:
+        raise HTTPException(status_code=400, detail="Rating must be 1-5")
+    
+    rating_id = f"rating_{uuid.uuid4().hex[:12]}"
+    
+    if user["user_id"] == ride["passenger_id"]:
+        rated_user_id = ride.get("driver_id")
+        rating_type = "driver_rating"
+    else:
+        rated_user_id = ride["passenger_id"]
+        rating_type = "passenger_rating"
+    
+    rating_doc = {
+        "rating_id": rating_id,
+        "ride_id": ride_id,
+        "rater_id": user["user_id"],
+        "rated_user_id": rated_user_id,
+        "rating": data.rating,
+        "feedback": data.feedback,
+        "rating_type": rating_type,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.ratings.insert_one(rating_doc)
+    await db.rides.update_one({"ride_id": ride_id}, {"$set": {rating_type: data.rating}})
+    
+    if rating_type == "driver_rating" and rated_user_id:
+        all_ratings = await db.ratings.find(
+            {"rated_user_id": rated_user_id, "rating_type": "driver_rating"}, {"_id": 0}
+        ).to_list(1000)
+        if all_ratings:
+            avg_rating = sum(r["rating"] for r in all_ratings) / len(all_ratings)
+            await db.driver_profiles.update_one(
+                {"user_id": rated_user_id},
+                {"$set": {"rating": round(avg_rating, 2)}}
+            )
+    
+    rating_doc.pop("_id", None)
+    return rating_doc
+
+# ========================= MISC =========================
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "NammaYatra API", "version": "1.0.0"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
+@api_router.get("/health")
+async def health():
+    return {"status": "healthy"}
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
-
-# Include the router in the main app
->>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
+# Include the router
 app.include_router(api_router)
 
 app.add_middleware(
@@ -595,16 +896,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-<<<<<<< HEAD
-=======
-# Configure logging
->>>>>>> 9f0514f (auto-commit for 0ea875e5-1178-499f-9dca-8337937a1861)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
